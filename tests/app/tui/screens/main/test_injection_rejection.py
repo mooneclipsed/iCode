@@ -22,6 +22,7 @@ from chrys.app.tui.screens.dialogs.vision_unsupported import VisionUnsupportedDi
 from chrys.app.tui.screens.main import MainScreen
 from chrys.app.tui.screens.main.event_handlers import BackendEventHandler
 from chrys.app.tui.screens.main.input_flow import InputFlowController
+from chrys.app.tui.screens.main.quotes import QuoteController
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState, RunState
 from chrys.app.tui.widgets.chrome.input_bar import InputBar
 from chrys.foundation.events.bus import EventBus
@@ -242,6 +243,7 @@ class _Harness:
             state=self.state,
             services=MainScreenServices(bus=self.bus),
             view=self.view,  # type: ignore[arg-type]
+            quotes=QuoteController(),
             # Workers are recorded, never run: a withdrawal's backend cancel
             # stays queued, as when the hook answers before it gets to run.
             start_worker=self.workers.append,

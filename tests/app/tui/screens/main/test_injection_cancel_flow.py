@@ -12,6 +12,7 @@ import pytest
 
 from chrys.app.tui.screens.main.input_flow import InputFlowController
 from chrys.app.tui.screens.main.navigation import MainNavigationController
+from chrys.app.tui.screens.main.quotes import QuoteController
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState
 from chrys.foundation.events.bus import EventBus
 from chrys.foundation.events.types import UserInjectCancel, UserMessage
@@ -52,6 +53,7 @@ def _make_controller(
         state=state,
         services=MainScreenServices(bus=bus),
         view=view,  # type: ignore[arg-type]
+        quotes=QuoteController(),
         start_worker=workers.append,
         handle_agent_message=_noop_agent_message,
         handle_error=_noop_error,

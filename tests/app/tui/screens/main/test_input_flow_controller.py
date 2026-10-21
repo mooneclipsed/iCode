@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from chrys.app.tui.screens.main.input_flow import InputFlowController
+from chrys.app.tui.screens.main.quotes import QuoteController
 from chrys.app.tui.screens.main.screen import MainScreen
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState
 from chrys.app.tui.support.gc_freeze import (
@@ -133,6 +134,7 @@ def _make_input_flow_controller(
         state=state,
         services=MainScreenServices(bus=bus),
         view=view,
+        quotes=QuoteController(),
         start_worker=start_worker or _unexpected_start_worker,
         handle_agent_message=handle_agent_message or _default_handle_agent_message,
         handle_error=handle_error or _default_handle_error,

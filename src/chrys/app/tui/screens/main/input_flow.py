@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from chrys.app.tui.screens.main.ports import InputFlowView, StartWorker
+from chrys.app.tui.screens.main.quotes import QuoteController
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState, SubmitKind
 from chrys.app.tui.support.gc_freeze import GcAbsorbReason, GcAbsorbRequested
 from chrys.app.tui.widgets.chrome.input_bar import INPUT_CONTINUE
@@ -36,6 +37,7 @@ class InputFlowController:
         state: MainScreenState,
         services: MainScreenServices,
         view: InputFlowView,
+        quotes: QuoteController,
         start_worker: StartWorker,
         handle_agent_message: Callable[[InvocationMessage], Awaitable[None]],
         handle_error: Callable[[Error], Awaitable[None]],
@@ -50,6 +52,7 @@ class InputFlowController:
         self._state = state
         self._services = services
         self._view = view
+        self._quotes = quotes
         self._start_worker = start_worker
         self._handle_agent_message = handle_agent_message
         self._handle_error = handle_error
@@ -110,34 +113,41 @@ class InputFlowController:
             return
         if not self._claim_submit(text, kind="turn"):
             return
+        # Pending quotes ride the wire text; the bubble renders what was sent,
+        # while history and the terminal title keep what the user typed.
+        wire_text = self._quotes.compose_outgoing(text)
         try:
-            event = UserMessage(text=text)
+            event = UserMessage(text=wire_text)
             self._state.render_gate.begin()
             if await self._publish_submit(event):
                 self._state.render_gate.finish(rendered=False)
                 return
         finally:
             self._state.submit.clear()
+        self._quotes.consume()
         if not event.started_turn:
             # Neither refused nor a new turn: the run seen ending here was still
             # finishing and took the message, or the backend dropped it. The
             # text is the user's again; if that run used it, its outcome shows
-            # it in the transcript and clears the composer.
+            # it in the transcript and clears the composer. The wire text comes
+            # back so quoted content stays editable rather than vanishing.
             self._state.render_gate.finish(rendered=False)
-            self._view.restore_input_draft(text)
+            self._view.restore_input_draft(wire_text)
             self._debug("UserMessage (no turn)", text[:60])
             return
-        await self._open_turn(event)
+        await self._open_turn(event, typed_text=text)
         self._debug("UserMessage", text[:60])
 
-    async def _open_turn(self, event: UserMessage) -> None:
+    async def _open_turn(self, event: UserMessage, *, typed_text: str | None = None) -> None:
         """Show *event* as the opener of the turn its publish just started.
 
         Called right after that publish returns, before the new run's task has
         had a chance to run, with the render gate up: the run's first events
-        then find the turn live and wait for the bubble.
+        then find the turn live and wait for the bubble. ``typed_text`` is the
+        composer's text behind the event (history and terminal title); the
+        event's own text is what the model received and the bubble renders.
         """
-        text = event.text
+        text = event.text if typed_text is None else typed_text
         self._state.run.started_at = event.timestamp
         self._view.set_terminal_title_for_user_message(text)
         self._set_agent_running(True)
@@ -152,7 +162,9 @@ class InputFlowController:
         try:
             # EventBus.publish is sequential; the backend fills prepared_contents
             # before returning so this previews exactly what the model receives.
-            await self._view.render_user_message(text, created_at=event.timestamp, contents=event.prepared_contents)
+            await self._view.render_user_message(
+                event.text, created_at=event.timestamp, contents=event.prepared_contents
+            )
             rendered = True
         finally:
             self._state.render_gate.finish(rendered=rendered)
@@ -164,16 +176,20 @@ class InputFlowController:
         """Queue a user message for mid-run injection without chat display."""
         if not self._claim_submit(text, kind="injection"):
             return
+        # The wire text is what the engine holds; an undone injection returns
+        # exactly this text to the input, so the quotes survive a cancel.
+        wire_text = self._quotes.compose_outgoing(text)
         try:
             injection_id = uuid4().hex[:12]
             self._view.lock_input_with_text()
-            self._state.pending_injection.begin(injection_id, text)
-            event = UserMessage(text=text, injection_id=injection_id)
+            self._state.pending_injection.begin(injection_id, wire_text)
+            event = UserMessage(text=wire_text, injection_id=injection_id)
             if await self._publish_submit(event):
                 self._state.pending_injection.clear()
                 return
         finally:
             self._state.submit.clear()
+        self._quotes.consume()
         if event.started_turn:
             # The run ended before the backend admitted this message, so it
             # opened a new turn with it: show that turn as a new turn's Enter
@@ -181,9 +197,9 @@ class InputFlowController:
             # so only the sent text leaves it.
             if self._state.pending_injection.matches(injection_id):
                 self._state.pending_injection.clear()
-                self._view.unlock_input_clearing(text)
+                self._view.unlock_input_clearing(wire_text)
             self._state.render_gate.begin()
-            await self._open_turn(event)
+            await self._open_turn(event, typed_text=text)
             self._debug("UserMessage (inject → new turn)", text[:60])
             return
         self._debug("UserMessage (inject)", text[:60])
