@@ -51,7 +51,7 @@ from chrys.app.tui.screens.main.model_indicator import (
 )
 from chrys.app.tui.screens.main.navigation import MainNavigationController
 from chrys.app.tui.screens.main.ports import StatusMessage
-from chrys.app.tui.screens.main.quotes import QuoteAddOutcome, QuoteController, quote_limit_notice
+from chrys.app.tui.screens.main.quotes import QuoteAddOutcome, quote_limit_notice
 from chrys.app.tui.screens.main.rollback_controller import RollbackController
 from chrys.app.tui.screens.main.runtime_info import RegistryRuntimeInfoProvider
 from chrys.app.tui.screens.main.session_handlers import RestoreRequest, SessionCallbacks, SessionHandler
@@ -494,7 +494,11 @@ class MainScreen(RightClickScreenCopyMixin, Screen):
             dismiss_suggestions=self._suggestions.dismiss_suggestions,
             debug=self._debug,
         )
-        self._quotes = QuoteController(on_changed=self._refresh_quote_chip)
+        # The controller lives on the state so backend event handlers (the
+        # injection outcome) can restore quotes the chip gave up; the screen
+        # binds the chip refresh once its widgets exist.
+        self._quotes = self._state.quotes
+        self._quotes.set_on_changed(self._refresh_quote_chip)
         # A quote offer snapshotted when its drag ended; consumed by the pill.
         self._pending_quote_pick: Quote | None = None
         # Drag tracking for quote offers, recorded on every selection update.
@@ -504,7 +508,6 @@ class MainScreen(RightClickScreenCopyMixin, Screen):
             state=self._state,
             services=self._services,
             view=self._view_adapter,
-            quotes=self._quotes,
             start_worker=self._start_worker,
             handle_agent_message=self._events.on_agent_message,
             handle_error=self._events.on_error,

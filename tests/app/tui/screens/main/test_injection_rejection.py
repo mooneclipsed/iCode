@@ -22,7 +22,6 @@ from chrys.app.tui.screens.dialogs.vision_unsupported import VisionUnsupportedDi
 from chrys.app.tui.screens.main import MainScreen
 from chrys.app.tui.screens.main.event_handlers import BackendEventHandler
 from chrys.app.tui.screens.main.input_flow import InputFlowController
-from chrys.app.tui.screens.main.quotes import QuoteController
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState, RunState
 from chrys.app.tui.widgets.chrome.input_bar import InputBar
 from chrys.foundation.events.bus import EventBus
@@ -37,6 +36,7 @@ from chrys.foundation.events.types import (
 from chrys.foundation.i18n import MessageRef
 from chrys.foundation.i18n.formatting import format_message
 from chrys.foundation.models.invocations import InvocationOrigin
+from chrys.foundation.text.conversation_selections import Quote, compose_outgoing_text
 from tests.support.tui_app_harness import SessionGenerationEngine, make_chrys_app
 from tests.support.tui_helpers import click_when_settled, fake_session_title, make_backend_handler
 from tests.support.waiting import wait_for
@@ -243,7 +243,6 @@ class _Harness:
             state=self.state,
             services=MainScreenServices(bus=self.bus),
             view=self.view,  # type: ignore[arg-type]
-            quotes=QuoteController(),
             # Workers are recorded, never run: a withdrawal's backend cancel
             # stays queued, as when the hook answers before it gets to run.
             start_worker=self.workers.append,
@@ -366,6 +365,45 @@ async def test_terminal_title_names_a_mid_run_message_once_the_turn_gets_it(outc
         "consumed_after_turn_end": [("bubble", _TEXT)],
     }
     assert h.shown == expected.get(outcome, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumed", [False, True], ids=["abandoned_restores", "consumed_drops"])
+async def test_injection_outcome_settles_its_staged_quotes(consumed: bool) -> None:
+    """The quotes a queued injection carried come back unless the model saw it."""
+    h = _Harness()
+    await h.start()
+    h.state.quotes.add("quoted while running", "assistant")
+    await h.send_mid_run(_TEXT)
+
+    # The quotes left the chip with the submit and ride the pending tracker.
+    assert h.state.quotes.quotes == ()
+    assert h.state.pending_injection.quotes == (Quote("quoted while running", "assistant"),)
+    injection_id = h.state.pending_injection.injection_id
+
+    await h.bus.publish(UserInjectResult(text=_TEXT, consumed=consumed, injection_id=injection_id))
+
+    if consumed:
+        assert h.state.quotes.quotes == ()
+    else:
+        # The injection never reached the model: its quotes return to the
+        # chip next to the composer's own text, ready for the next submit.
+        assert h.state.quotes.quotes == (Quote("quoted while running", "assistant"),)
+
+
+@pytest.mark.asyncio
+async def test_consumed_injection_title_names_the_typed_body_not_the_block() -> None:
+    h = _Harness()
+    await h.start()
+    h.state.quotes.add("quoted while running", None)
+    await h.send_mid_run(_TEXT)
+    injection_id = h.state.pending_injection.injection_id
+    wire_text = compose_outgoing_text(_TEXT, [Quote("quoted while running")])
+
+    await h.bus.publish(UserInjectResult(text=wire_text, consumed=True, injection_id=injection_id))
+
+    # The tab shows the typed body; the bubble renders the full wire text.
+    assert h.shown == [("title", _TEXT), ("bubble", wire_text)]
 
 
 @pytest.mark.asyncio

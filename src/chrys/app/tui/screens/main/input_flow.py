@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from chrys.app.tui.screens.main.ports import InputFlowView, StartWorker
-from chrys.app.tui.screens.main.quotes import QuoteController
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState, SubmitKind
 from chrys.app.tui.support.gc_freeze import GcAbsorbReason, GcAbsorbRequested
 from chrys.app.tui.widgets.chrome.input_bar import INPUT_CONTINUE
@@ -26,6 +25,7 @@ from chrys.foundation.events.types import (
 
 if TYPE_CHECKING:
     from chrys.foundation.events.bus import EventBus
+    from chrys.foundation.text.conversation_selections import Quote
 
 
 class InputFlowController:
@@ -37,7 +37,6 @@ class InputFlowController:
         state: MainScreenState,
         services: MainScreenServices,
         view: InputFlowView,
-        quotes: QuoteController,
         start_worker: StartWorker,
         handle_agent_message: Callable[[InvocationMessage], Awaitable[None]],
         handle_error: Callable[[Error], Awaitable[None]],
@@ -52,7 +51,7 @@ class InputFlowController:
         self._state = state
         self._services = services
         self._view = view
-        self._quotes = quotes
+        self._quotes = state.quotes
         self._start_worker = start_worker
         self._handle_agent_message = handle_agent_message
         self._handle_error = handle_error
@@ -77,9 +76,10 @@ class InputFlowController:
 
     def request_retry(self, text: str = "") -> None:
         """Schedule retry/continue from a sync Textual event handler."""
-        event = self._begin_retry(text)
-        if event is not None:
-            self._start_worker(partial(self._publish_retry, event))
+        prepared = self._begin_retry(text)
+        if prepared is not None:
+            event, sent_quotes = prepared
+            self._start_worker(partial(self._publish_retry, event, sent_quotes, text))
 
     def _claim_submit(self, text: str, *, kind: SubmitKind) -> bool:
         """Make *text* the one submit in flight, or hand it back to the composer.
@@ -114,8 +114,10 @@ class InputFlowController:
         if not self._claim_submit(text, kind="turn"):
             return
         # Pending quotes ride the wire text; the bubble renders what was sent,
-        # while history and the terminal title keep what the user typed.
-        wire_text = self._quotes.compose_outgoing(text)
+        # while history and the terminal title keep what the user typed. The
+        # snapshot settles the consume below: quotes added while the publish
+        # awaited hooks or image preparation stay pending for the next message.
+        wire_text, sent_quotes = self._quotes.compose(text)
         try:
             event = UserMessage(text=wire_text)
             self._state.render_gate.begin()
@@ -124,7 +126,7 @@ class InputFlowController:
                 return
         finally:
             self._state.submit.clear()
-        self._quotes.consume()
+        self._quotes.consume(sent_quotes)
         if not event.started_turn:
             # Neither refused nor a new turn: the run seen ending here was still
             # finishing and took the message, or the backend dropped it. The
@@ -176,20 +178,21 @@ class InputFlowController:
         """Queue a user message for mid-run injection without chat display."""
         if not self._claim_submit(text, kind="injection"):
             return
-        # The wire text is what the engine holds; an undone injection returns
-        # exactly this text to the input, so the quotes survive a cancel.
-        wire_text = self._quotes.compose_outgoing(text)
+        # The wire text is what the engine holds. The staged quotes ride it
+        # and are restored to the chip when the injection is cancelled or
+        # abandoned — the locked composer only ever shows the typed text.
+        wire_text, sent_quotes = self._quotes.compose(text)
         try:
             injection_id = uuid4().hex[:12]
             self._view.lock_input_with_text()
-            self._state.pending_injection.begin(injection_id, wire_text)
+            self._state.pending_injection.begin(injection_id, wire_text, quotes=sent_quotes)
             event = UserMessage(text=wire_text, injection_id=injection_id)
             if await self._publish_submit(event):
                 self._state.pending_injection.clear()
                 return
         finally:
             self._state.submit.clear()
-        self._quotes.consume()
+        self._quotes.consume(sent_quotes)
         if event.started_turn:
             # The run ended before the backend admitted this message, so it
             # opened a new turn with it: show that turn as a new turn's Enter
@@ -215,7 +218,9 @@ class InputFlowController:
         if not pending.active:
             return False
         injection_id = pending.injection_id
+        staged_quotes = pending.quotes
         pending.clear()
+        self._quotes.restore(staged_quotes)
         self._view.unlock_input_keep_if_locked()
         if injection_id is not None:
             self._start_worker(partial(self._publish_inject_cancel, injection_id))
@@ -257,26 +262,31 @@ class InputFlowController:
             self._view.flash_interrupted()
             # The interrupt already unlocks the input with the text kept; drop
             # pending-injection tracking so a later abandoned result (or Esc)
-            # cannot act on an entry that no longer belongs to a live turn.
+            # cannot act on an entry that no longer belongs to a live turn,
+            # and hand a still-queued injection's quotes back for editing.
+            staged_quotes = self._state.pending_injection.quotes
             self._state.pending_injection.clear()
+            self._quotes.restore(staged_quotes)
             self._view.unlock_input_keep_if_locked()
         self._post_gc_message(terminal_request)
         self._view.set_retry_mode(True, label=INPUT_CONTINUE.bind())
         self._debug("UserInterrupt", "")
 
-    def _begin_retry(self, text: str) -> UserRetry | None:
+    def _begin_retry(self, text: str) -> tuple[UserRetry, tuple[Quote, ...]] | None:
         """Reserve admission before scheduling, including same-tick clicks."""
         if self._state.run.agent_running or self._state.submit.active:
             return None
 
-        event = UserRetry(text=text)
+        # Pending quotes ride the retry note like a normal message; history
+        # and the terminal title keep what the user typed.
+        wire_text, sent_quotes = self._quotes.compose(text)
+        event = UserRetry(text=wire_text)
         self._state.render_gate.begin()
         self._state.submit.begin(text, kind="retry")
         self._view.set_retry_pending(True)
-        return event
+        return event, sent_quotes
 
-    async def _publish_retry(self, event: UserRetry) -> None:
-        text = event.text
+    async def _publish_retry(self, event: UserRetry, sent_quotes: tuple[Quote, ...], typed_text: str) -> None:
         try:
             if await self._publish_submit(event):
                 self._state.render_gate.finish(rendered=False)
@@ -288,17 +298,21 @@ class InputFlowController:
             self._state.submit.clear()
             self._view.set_retry_pending(False)
 
+        self._quotes.consume(sent_quotes)
         self._view.hide_trailing_status_action()
         self._state.run.started_at = event.timestamp
         self._set_agent_running(True)
         self._view.start_run_status(STATUS_RESUMING.bind())
 
-        if text:
-            self._view.set_terminal_title_for_user_message(text)
-            self._view.add_input_history(text, session_id=self._view.current_chat_session_id() or None)
+        if event.text:
+            # A quotes-only retry (empty typed text) still renders its note;
+            # the title and history stay keyed to text the user typed.
+            if typed_text:
+                self._view.set_terminal_title_for_user_message(typed_text)
+                self._view.add_input_history(typed_text, session_id=self._view.current_chat_session_id() or None)
             rendered = False
             try:
-                await self._view.render_user_retry_note(text, created_at=event.timestamp)
+                await self._view.render_user_retry_note(event.text, created_at=event.timestamp)
                 rendered = True
             finally:
                 self._state.render_gate.finish(rendered=rendered)
@@ -308,4 +322,4 @@ class InputFlowController:
             self._state.render_gate.finish(rendered=True)
             await self.flush_deferred_agent_messages()
 
-        self._debug("UserRetry", text[:60] if text else "")
+        self._debug("UserRetry", typed_text[:60] if typed_text else "")

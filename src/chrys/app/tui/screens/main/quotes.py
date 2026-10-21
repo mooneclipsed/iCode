@@ -105,9 +105,47 @@ class QuoteController:
         """Compose the wire text for *typed* with the pending quotes."""
         return compose_outgoing_text(typed, self._quotes)
 
-    def consume(self) -> None:
-        """Clear the buffer once its quotes ride a published message."""
-        self.clear()
+    def compose(self, typed: str) -> tuple[str, tuple[Quote, ...]]:
+        """The wire text for *typed* plus the exact pending quotes it carries.
+
+        The snapshot is what a submit settles against: ``consume`` removes
+        only these instances, so quotes added while the publish awaited
+        hooks or image preparation stay pending for the next message, and a
+        withdrawn submit can ``restore`` exactly the ones it claimed.
+        """
+        return compose_outgoing_text(typed, self._quotes), tuple(self._quotes)
+
+    def consume(self, sent: tuple[Quote, ...] | None = None) -> None:
+        """Drop the quotes that rode a published message.
+
+        Without *sent* every pending quote is dropped; with the snapshot
+        from :meth:`compose` only those instances leave — ones added after
+        the composition stay pending. Identity, not equality, decides: a
+        later quote with the same text is fresh work.
+        """
+        if sent is None:
+            self.clear()
+            return
+        sent_ids = {id(quote) for quote in sent}
+        if not any(id(quote) in sent_ids for quote in self._quotes):
+            return
+        self._quotes = [quote for quote in self._quotes if id(quote) not in sent_ids]
+        self._notify_changed()
+
+    def restore(self, staged: tuple[Quote, ...]) -> None:
+        """Return quotes a withdrawn submit had claimed to the pending list.
+
+        Cancelled and abandoned injections restore what they carried; quotes
+        still present (a submit refused before its consume) dedupe out by
+        identity. Restored quotes keep their original order ahead of quotes
+        added while the submit was in flight, without re-running the add
+        limits — each quote passed its limit when it was first added.
+        """
+        present = {id(quote) for quote in self._quotes}
+        returning = [quote for quote in staged if id(quote) not in present]
+        if returning:
+            self._quotes[:0] = returning
+            self._notify_changed()
 
     def _notify_changed(self) -> None:
         if self._on_changed is not None:
