@@ -407,6 +407,32 @@ async def test_consumed_injection_title_names_the_typed_body_not_the_block() -> 
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_admission_keeps_restored_quotes_when_not_refused() -> None:
+    """Esc while a message is being admitted restores its quotes for good.
+
+    The backend abandons a cancelled submit without refusing it, so the
+    queued flow's consume after the publish must not wipe the quotes the
+    cancel already handed back to the chip.
+    """
+    h = _Harness()
+
+    async def cancel_during_admission(_event: UserMessage) -> None:
+        # Esc while the hook runs; the backend marks the submit cancelled and
+        # abandons it later — no Error, no refusal on the publish.
+        assert h.controller.cancel_pending_injection() is True
+
+    await h.start(cancel_during_admission)
+    h.state.quotes.add("quoted while running", "assistant")
+    await h.send_mid_run(_TEXT)
+
+    assert h.state.quotes.quotes == (Quote("quoted while running", "assistant"),)
+    assert h.input_bar.locked is False
+    assert h.input_bar.value == _TEXT
+    assert h.state.pending_injection.active is False
+    assert h.shown == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("agent_running", [True, False], ids=["mid_run", "new_turn"])
 async def test_second_submit_in_the_same_tick_goes_back_to_the_composer(agent_running: bool) -> None:
     """Two submits scheduled before either worker runs: only the first is sent.

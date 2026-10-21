@@ -192,12 +192,14 @@ class InputFlowController:
                 return
         finally:
             self._state.submit.clear()
-        self._quotes.consume(sent_quotes)
         if event.started_turn:
             # The run ended before the backend admitted this message, so it
             # opened a new turn with it: show that turn as a new turn's Enter
             # would. The run's end or an Esc handed the composer back meanwhile,
-            # so only the sent text leaves it.
+            # so only the sent text leaves it. The model saw the text, quotes
+            # included — even a cancel fired during the admission above cannot
+            # take them back.
+            self._quotes.consume(sent_quotes)
             if self._state.pending_injection.matches(injection_id):
                 self._state.pending_injection.clear()
                 self._view.unlock_input_clearing(wire_text)
@@ -205,6 +207,11 @@ class InputFlowController:
             await self._open_turn(event, typed_text=text)
             self._debug("UserMessage (inject → new turn)", text[:60])
             return
+        # Queued on the live run. A cancel pressed while the publish awaited
+        # already restored the quotes; consuming unconditionally here would
+        # wipe them again, and the abandoned result cannot undo it (stale id).
+        if self._state.pending_injection.matches(injection_id):
+            self._quotes.consume(sent_quotes)
         self._debug("UserMessage (inject)", text[:60])
 
     def cancel_pending_injection(self) -> bool:
